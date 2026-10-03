@@ -111,3 +111,47 @@ async def test_cancellation_during_retry_backoff_returns_pool_connection(cache_f
 
     async with cache_factory(retry=Retry(DelayedBackoff(), 2)) as (cache, client):
         await check_cancelled_backoff(cache, client, ConnectionError, waiting)
+
+
+@pytest.mark.parametrize("operation", ["aget_many", "aset_many", "adelete_many"])
+async def test_cancelled_batch_returns_no_connection_with_an_unread_reply(operation):
+    from tests.services.resilience import BATCHES, check_cancelled_batch
+
+    cache = AsyncValkeyCache(
+        URL,
+        {
+            "KEY_PREFIX": "valkey-cancel-batch-" + uuid4().hex,
+            "OPTIONS": {"socket_connect_timeout": 2, "socket_timeout": 2},
+        },
+    )
+    try:
+        await cache.async_client.ping()
+        pool = cache.async_client.connection_pool
+        (connection,) = pool._available_connections
+        await check_cancelled_batch(
+            cache,
+            type(connection._parser),
+            lambda: len(pool._in_use_connections),
+            operation,
+            BATCHES[operation][1],
+        )
+    finally:
+        try:
+            await cache.adelete_many(["one", "two"])
+        finally:
+            await cache.aclose()
+
+
+async def test_close_with_commands_in_flight_returns():
+    from tests.services.resilience import check_close_with_commands_in_flight
+
+    cache = AsyncValkeyCache(
+        URL,
+        {
+            "KEY_PREFIX": "valkey-close-in-flight-" + uuid4().hex,
+            "OPTIONS": {"max_connections": 2, "socket_connect_timeout": 2},
+        },
+    )
+    await check_close_with_commands_in_flight(
+        cache, cache.async_client, ConnectionError
+    )

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aiodrf-async-cache"
-version = "0.1.0"
+version = "0.2.0"
 description = "Native async Redis and Valkey cache backends for Django."
 readme = "README.md"
 license = "BSD-3-Clause"
@@ -51,7 +51,7 @@ dev = ["django-redis>=7", "pytest>=8", "pytest-django>=4.9", "pytest-asyncio>=0.
 packages = ["src/aiodrf_async_cache"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/src", "/tests", "/tools", "/pyproject.toml", "/noxfile.py", "/*.md", "/LICENSE", "/NOTICE"]
+include = ["/src", "/tests", "/tools", "/docs", "/pyproject.toml", "/noxfile.py", "/*.md", "/LICENSE", "/NOTICE"]
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "tests.settings"

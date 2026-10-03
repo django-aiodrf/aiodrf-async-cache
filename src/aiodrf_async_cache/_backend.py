@@ -42,6 +42,9 @@ class NativeCache(BaseCache):
     cluster_class: Any
     retry_class: Any
     no_backoff_class: Any
+    # Run Cluster pipelines in a task of their own that a cancelled caller
+    # does not interrupt, for a driver that leaks the node's connection then.
+    _shield_cluster_pipelines = False
 
     def __init__(self, server: str, params: dict[str, Any]) -> None:
         options = dict(params.get("OPTIONS", {}))
@@ -54,7 +57,8 @@ class NativeCache(BaseCache):
         self.topology = options.pop("topology", "standalone")
         if self.topology not in {"standalone", "sentinel", "cluster"}:
             raise ImproperlyConfigured(
-                "topology must be standalone, sentinel or cluster."
+                "topology must be standalone, sentinel or cluster; "
+                f"got {self.topology!r}."
             )
         self._sentinels = options.pop("sentinels", None)
         self._sentinel_kwargs = options.pop("sentinel_kwargs", {})
@@ -64,7 +68,9 @@ class NativeCache(BaseCache):
             )
         self.callback_mode = options.pop("callback_mode", "thread")
         if self.callback_mode not in {"thread", "inline"}:
-            raise ImproperlyConfigured("callback_mode must be thread or inline.")
+            raise ImproperlyConfigured(
+                f"callback_mode must be thread or inline; got {self.callback_mode!r}."
+            )
         serializer = options.pop("serializer", RedisSerializer)
         if isinstance(serializer, str):
             serializer = import_string(serializer)
@@ -75,15 +81,24 @@ class NativeCache(BaseCache):
             callable(getattr(self._async_serializer, name, None))
             for name in ("dumps", "loads")
         ):
-            raise ImproperlyConfigured("serializer must provide dumps() and loads().")
+            raise ImproperlyConfigured(
+                "serializer must provide dumps() and loads(); "
+                f"got {type(self._async_serializer).__qualname__}."
+            )
         pool_class = options.pop("async_pool_class", self.blocking_pool_class)
         if isinstance(pool_class, str):
             pool_class = import_string(pool_class)
         if not isinstance(pool_class, type) or not issubclass(
             pool_class, self.pool_class
         ):
+            # redis-py has a sync and an async class of the same name.
+            got = (
+                f"{pool_class.__module__}.{pool_class.__qualname__}"
+                if isinstance(pool_class, type)
+                else repr(pool_class)
+            )
             raise ImproperlyConfigured(
-                "async_pool_class must be the driver's async ConnectionPool."
+                f"async_pool_class must be the driver's async ConnectionPool; got {got}."
             )
         pool_options = {"max_connections": options.pop("max_connections", 20)}
         if self.topology == "standalone" and issubclass(
@@ -114,6 +129,7 @@ class NativeCache(BaseCache):
         # outside any loop, can construct it.
         self._owner_loop: asyncio.AbstractEventLoop | None = None
         self._closed = False
+        self._pipelines: set[asyncio.Task[Any]] = set()
 
     @property
     def async_client(self) -> Any:
@@ -186,6 +202,23 @@ class NativeCache(BaseCache):
             return [callback(value) for value in values]
 
         return await self._callback(convert)
+
+    async def _pipeline(self, fill: Callable[[Any], None]) -> list[Any]:
+        async def execute() -> list[Any]:
+            async with self.async_client.pipeline(
+                transaction=self.topology != "cluster"
+            ) as pipeline:
+                fill(pipeline)
+                return await pipeline.execute()
+
+        if self.topology != "cluster" or not self._shield_cluster_pipelines:
+            return await execute()
+        # The task finishes reading its replies (within socket_timeout) and
+        # returns its connection after the caller is cancelled.
+        task = asyncio.create_task(execute())
+        self._pipelines.add(task)
+        task.add_done_callback(self._pipelines.discard)
+        return await asyncio.shield(task)
 
     async def amake_key(self, key: Any, version: int | None = None) -> Any:
         """Await KEY_FUNCTION and preserve Django's make_key/validate_key hooks."""
@@ -293,10 +326,12 @@ class NativeCache(BaseCache):
             return {}
         encoded_keys = [await self.amake_key(key, version=version) for key in keys]
         if self.topology == "cluster":
-            async with self.async_client.pipeline(transaction=False) as pipeline:
+
+            def fill(pipeline: Any) -> None:
                 for key in encoded_keys:
                     pipeline.get(key)
-                values = await pipeline.execute()
+
+            values = await self._pipeline(fill)
         else:
             values = await self.async_client.mget(encoded_keys)
         found = [
@@ -334,16 +369,16 @@ class NativeCache(BaseCache):
                 )
                 for key, value in data.items()
             }
-        async with self.async_client.pipeline(
-            transaction=self.topology != "cluster"
-        ) as pipeline:
+
+        def fill(pipeline: Any) -> None:
             # Each SET carries its TTL, including on cross-slot Cluster batches.
             for key, value in encoded.items():
                 if timeout == 0:
                     pipeline.delete(key)
                 else:
                     pipeline.set(key, value, ex=timeout)
-            await pipeline.execute()
+
+        await self._pipeline(fill)
         return []
 
     async def adelete_many(
@@ -351,12 +386,12 @@ class NativeCache(BaseCache):
     ) -> None:
         encoded = [await self.amake_key(key, version=version) for key in keys]
         if encoded:
-            async with self.async_client.pipeline(
-                transaction=self.topology != "cluster"
-            ) as pipeline:
+
+            def fill(pipeline: Any) -> None:
                 for key in encoded:
                     pipeline.delete(key)
-                await pipeline.execute()
+
+            await self._pipeline(fill)
 
     async def aincr(self, key: Any, delta: int = 1, version: int | None = None) -> Any:
         if type(self._async_serializer) is not RedisSerializer and not getattr(

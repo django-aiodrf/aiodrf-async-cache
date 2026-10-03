@@ -290,3 +290,121 @@ async def test_raw_pipeline_uses_the_owned_pool(cache):
         pipeline.incr(cache.make_key("raw"))
         assert await pipeline.execute() == [True, 5]
     assert await cache.aget("raw") == 5
+
+
+def _standalone_parser(client):
+    (connection,) = client.connection_pool._available_connections
+    return type(connection._parser)
+
+
+@pytest.mark.parametrize("operation", ["aget_many", "aset_many", "adelete_many"])
+async def test_cancelled_batch_returns_no_connection_with_an_unread_reply(
+    cache, operation
+):
+    from tests.services.resilience import BATCHES, check_cancelled_batch
+
+    await cache.async_client.ping()
+    pool = cache.async_client.connection_pool
+    await check_cancelled_batch(
+        cache,
+        _standalone_parser(cache.async_client),
+        lambda: len(pool._in_use_connections),
+        operation,
+        BATCHES[operation][1],
+    )
+
+
+async def test_close_with_commands_in_flight_returns():
+    from redis.exceptions import ConnectionError
+
+    from tests.services.resilience import check_close_with_commands_in_flight
+
+    cache = AsyncRedisCache(
+        URL,
+        {
+            "KEY_PREFIX": "close-in-flight-" + uuid4().hex,
+            "OPTIONS": {"max_connections": 2, "socket_connect_timeout": 2},
+        },
+    )
+    await check_close_with_commands_in_flight(
+        cache, cache.async_client, ConnectionError
+    )
+    with pytest.raises(RuntimeError, match="closed"):
+        await cache.aget("value")
+
+
+async def test_lifespan_ping_reaches_the_server():
+    from django.test import override_settings
+
+    from aiodrf_async_cache.lifespan import cache_lifespan
+
+    config = {
+        "native": {
+            "BACKEND": "aiodrf_async_cache.redis.AsyncRedisCache",
+            "LOCATION": URL,
+        }
+    }
+    with override_settings(CACHES=config):
+        async with cache_lifespan("native", ping=True) as backend:
+            pool = backend.async_client.connection_pool
+            assert len(pool._available_connections) == 1
+        assert not any(c.is_connected for c in pool._available_connections)
+
+
+async def test_lifespan_closes_the_pool_when_the_application_fails_after_startup():
+    from django.test import override_settings
+
+    from aiodrf_async_cache.lifespan import cache_lifespan
+
+    config = {
+        "native": {
+            "BACKEND": "aiodrf_async_cache.redis.AsyncRedisCache",
+            "LOCATION": URL,
+        }
+    }
+    with override_settings(CACHES=config):
+        with pytest.raises(ValueError, match="startup failed"):  # noqa: PT012 -- exercise exceptional context-manager exit
+            async with cache_lifespan("native") as backend:
+                await backend.aset("lifespan-" + uuid4().hex, 1, timeout=5)
+                pool = backend.async_client.connection_pool
+                assert len(pool._available_connections) == 1
+                raise ValueError("startup failed")
+    assert not pool._in_use_connections
+    assert not any(c.is_connected for c in pool._available_connections)
+
+
+async def test_single_flight_on_the_native_backend(cache):
+    from aiodrf_async_cache.singleflight import aget_or_set
+
+    calls = 0
+
+    async def load():
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.01)
+        return {"loaded": True}
+
+    results = await asyncio.gather(
+        *(aget_or_set(cache, "flight", load) for _ in range(50))
+    )
+    assert calls == 1
+    assert results == [{"loaded": True}] * 50
+    assert await cache.aget("flight") == {"loaded": True}
+
+
+async def test_a_rejected_password_is_not_in_the_error():
+    from urllib.parse import urlsplit, urlunsplit
+
+    from redis.exceptions import AuthenticationError, ResponseError
+
+    password = "wrong-Pa55word"
+    parts = urlsplit(URL)
+    netloc = f"no-such-user:{password}@{parts.hostname}:{parts.port or 6379}"
+    cache = AsyncRedisCache(urlunsplit(parts._replace(netloc=netloc)), {})
+    try:
+        with pytest.raises((AuthenticationError, ResponseError)) as error:
+            await cache.aget("key")
+        assert password not in str(error.value)
+        assert password not in repr(error.value)
+    finally:
+        await cache.aclose()

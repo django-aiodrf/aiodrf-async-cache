@@ -26,3 +26,7 @@ class AsyncValkeyCache(NativeCache):
     cluster_class = ValkeyCluster
     retry_class = Retry
     no_backoff_class = NoBackoff
+    # valkey-py 6.1's ClusterNode.execute_pipeline returns its connection only
+    # when the pipeline completes: each cancelled batch would keep one of the
+    # node's max_connections until the node refuses every command.
+    _shield_cluster_pipelines = True

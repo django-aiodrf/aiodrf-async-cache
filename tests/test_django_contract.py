@@ -139,3 +139,18 @@ async def test_key_validation_uses_djangos_warning():
     with pytest.warns(CacheKeyWarning):
         await cache.amake_key("not portable")
     await cache.aclose()
+
+
+async def test_driver_lock_as_documented(cache):
+    import importlib
+
+    driver = type(cache.async_client).__module__.split(".")[0]
+    LockError = importlib.import_module(f"{driver}.exceptions").LockError
+    # The name is not passed through make_key: it carries its own prefix.
+    name = f"{cache.key_prefix}:lock:report"
+    async with cache.async_client.lock(name, timeout=30, blocking_timeout=5):
+        assert await cache.async_client.exists(name)
+        with pytest.raises(LockError):
+            async with cache.async_client.lock(name, timeout=30, blocking_timeout=0.05):
+                pass
+    assert not await cache.async_client.exists(name)
