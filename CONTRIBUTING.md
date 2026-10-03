@@ -42,6 +42,10 @@ AIODRF_TEST_VALKEY_URL=valkey://localhost:6380/0 uv run pytest
 Sentinel and Cluster run on their own Compose project:
 see `tests/services/cache-topologies.md`.
 
+`tools/benchmark.py` times the cache operations against a local Redis; its
+docstring says how to run it. Publish results only with the machine they
+were measured on.
+
 ## Rules for changes
 
 - Use Django's public APIs, and keep Django's semantics and method

@@ -121,3 +121,71 @@ async def test_explicit_sentinel_failover_preserves_owned_client(backend_class):
         await cache.adelete("value")
         await cache.aclose()
         await sentinel.aclose()
+
+
+@pytest.mark.parametrize("operation", ["aget_many", "aset_many", "adelete_many"])
+async def test_cancelled_cluster_batch_returns_no_connection(backend_class, operation):
+    from tests.services.resilience import check_cancelled_batch
+
+    location = "redis://127.0.0.1:17631/0"
+    if backend_class.__name__ == "AsyncValkeyCache":
+        location = location.replace("redis://", "valkey://")
+    cache = backend_class(
+        location,
+        {
+            "KEY_PREFIX": "topology-cancel-" + uuid4().hex,
+            "OPTIONS": {
+                "topology": "cluster",
+                "socket_timeout": 2,
+                "socket_connect_timeout": 2,
+            },
+        },
+    )
+    try:
+        await cache.aset_many({"one": 1, "two": 2}, timeout=30)
+        nodes = cache.async_client.get_nodes()
+        connection = next(node._connections[0] for node in nodes if node._connections)
+
+        def in_use():
+            return sum(len(node._connections) - len(node._free) for node in nodes)
+
+        await check_cancelled_batch(
+            cache, type(connection._parser), in_use, operation, 1
+        )
+    finally:
+        await cache.adelete_many(["one", "two"])
+        await cache.aclose()
+
+
+async def test_cancelled_cluster_batches_do_not_exhaust_node_connections(
+    backend_class,
+):
+    location = "redis://127.0.0.1:17631/0"
+    if backend_class.__name__ == "AsyncValkeyCache":
+        location = location.replace("redis://", "valkey://")
+    cache = backend_class(
+        location,
+        {
+            "KEY_PREFIX": "topology-exhaust-" + uuid4().hex,
+            "OPTIONS": {
+                "topology": "cluster",
+                "max_connections": 2,
+                "socket_timeout": 2,
+                "socket_connect_timeout": 2,
+            },
+        },
+    )
+    # One key, so every batch goes to the same node.
+    try:
+        await cache.aset_many({"one": 1}, timeout=30)
+        for _ in range(3):
+            task = asyncio.create_task(cache.aget_many(["one"]))
+            # Let it send the command, then cancel it before the reply.
+            for _ in range(3):
+                await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        assert await cache.aget_many(["one"]) == {"one": 1}
+    finally:
+        await cache.adelete_many(["one"])
+        await cache.aclose()

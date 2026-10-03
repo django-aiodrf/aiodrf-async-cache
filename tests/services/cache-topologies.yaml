@@ -6,25 +6,63 @@ x-node: &node
   network_mode: host
   mem_limit: 128m
   tmpfs: [/data]
+# `docker compose up --wait` returns once every service reports healthy: the
+# nodes answer PING, the Cluster covers all slots, the replica is in sync and
+# Sentinel knows it. Both images ship redis-cli.
+x-health: &health
+  interval: 1s
+  timeout: 2s
+  retries: 30
 services:
   cluster-one:
     <<: *node
     command: ["${CACHE_SERVER:-redis-server}", --bind, 127.0.0.1, --port, "17631", --cluster-enabled, "yes", --cluster-config-file, nodes.conf, --cluster-announce-ip, 127.0.0.1, --save, "", --appendonly, "no"]
+    healthcheck:
+      <<: *health
+      test: ["CMD-SHELL", "redis-cli -p 17631 ping | grep -q PONG"]
   cluster-two:
     <<: *node
     command: ["${CACHE_SERVER:-redis-server}", --bind, 127.0.0.1, --port, "17632", --cluster-enabled, "yes", --cluster-config-file, nodes.conf, --cluster-announce-ip, 127.0.0.1, --save, "", --appendonly, "no"]
+    healthcheck:
+      <<: *health
+      test: ["CMD-SHELL", "redis-cli -p 17632 ping | grep -q PONG"]
   cluster-three:
     <<: *node
     command: ["${CACHE_SERVER:-redis-server}", --bind, 127.0.0.1, --port, "17633", --cluster-enabled, "yes", --cluster-config-file, nodes.conf, --cluster-announce-ip, 127.0.0.1, --save, "", --appendonly, "no"]
+    healthcheck:
+      <<: *health
+      test: ["CMD-SHELL", "redis-cli -p 17633 ping | grep -q PONG"]
+  cluster:
+    <<: *node
+    # Joins the three nodes once, then stays up so that its health check can
+    # report when every node sees the whole Cluster.
+    depends_on:
+      cluster-one: {condition: service_healthy}
+      cluster-two: {condition: service_healthy}
+      cluster-three: {condition: service_healthy}
+    entrypoint: [sh, -c]
+    command: ["redis-cli --cluster create 127.0.0.1:17631 127.0.0.1:17632 127.0.0.1:17633 --cluster-replicas 0 --cluster-yes && exec sleep infinity"]
+    healthcheck:
+      <<: *health
+      test: ["CMD-SHELL", "for port in 17631 17632 17633; do redis-cli -p $$port cluster info | grep -q cluster_state:ok || exit 1; done"]
   primary:
     <<: *node
     command: ["${CACHE_SERVER:-redis-server}", --bind, 127.0.0.1, --port, "17634", --save, "", --appendonly, "no"]
+    healthcheck:
+      <<: *health
+      test: ["CMD-SHELL", "redis-cli -p 17634 ping | grep -q PONG"]
   replica:
     <<: *node
     command: ["${CACHE_SERVER:-redis-server}", --bind, 127.0.0.1, --port, "17635", --replicaof, 127.0.0.1, "17634", --save, "", --appendonly, "no"]
+    healthcheck:
+      <<: *health
+      test: ["CMD-SHELL", "redis-cli -p 17635 info replication | grep -q master_link_status:up"]
   sentinel:
     <<: *node
     # Sentinel rewrites its own runtime configuration, so copy the test template.
     entrypoint: [sh, -c]
     command: ["cp /config/sentinel.conf /data/sentinel.conf && exec ${CACHE_SERVER:-redis-server} /data/sentinel.conf --sentinel"]
     volumes: ["./sentinel.conf:/config/sentinel.conf:ro"]
+    healthcheck:
+      <<: *health
+      test: ["CMD-SHELL", "redis-cli -p 17636 sentinel master aiodrf-test | grep -A1 -x num-slaves | grep -qx 1"]

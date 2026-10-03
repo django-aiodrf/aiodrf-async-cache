@@ -73,8 +73,7 @@ jobs:
 
   services:
     # The Redis and Valkey contract and fault tests, against disposable
-    # service containers. Sentinel and Cluster run locally: see
-    # tests/services/cache-topologies.md.
+    # service containers. Sentinel and Cluster run in the topologies job.
     needs: approval
     if: ${{ !failure() && !cancelled() }}
     runs-on: ubuntu-latest
@@ -102,6 +101,39 @@ jobs:
           version: '0.12.13'
       - run: uv python install 3.14
       - run: uv run nox -s "tests-3.14(django='6.1')"
+
+  topologies:
+    # Sentinel discovery and failover and cross-slot Cluster batches, on the
+    # Compose project in tests/services/cache-topologies.yaml (host network,
+    # loopback ports 17631-17636).
+    needs: approval
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: redis:7.4-alpine
+            server: redis-server
+          - image: valkey/valkey:8.1-alpine
+            server: valkey-server
+    env:
+      CACHE_IMAGE: ${{ matrix.image }}
+      CACHE_SERVER: ${{ matrix.server }}
+      AIODRF_TEST_CACHE_TOPOLOGIES: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: '0.12.13'
+      - run: uv python install 3.14
+      - run: docker compose -f tests/services/cache-topologies.yaml up -d --wait
+      - run: uv run nox -s "tests-3.14(django='6.1')" -- tests/services/test_topologies.py
+      - if: always()
+        run: docker compose -f tests/services/cache-topologies.yaml down -v
 
   package:
     needs: approval

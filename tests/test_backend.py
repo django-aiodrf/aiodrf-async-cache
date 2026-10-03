@@ -2,7 +2,7 @@
 
 import asyncio
 import threading
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from django.core.exceptions import ImproperlyConfigured
@@ -102,17 +102,43 @@ async def test_cluster_batches_use_single_key_commands_without_transactions():
 
 
 @pytest.mark.parametrize(
-    "options",
+    ("options", "message"),
     [
-        {"topology": "unknown"},
-        {"topology": "sentinel"},
-        {"callback_mode": "unknown"},
-        {"decode_responses": True},
+        (
+            {"topology": "clustr"},
+            "topology must be standalone, sentinel or cluster; got 'clustr'.",
+        ),
+        (
+            {"topology": "sentinel"},
+            "Sentinel requires sentinels=[(host, port), ...]; LOCATION is the service name.",
+        ),
+        (
+            {"callback_mode": "threads"},
+            "callback_mode must be thread or inline; got 'threads'.",
+        ),
+        (
+            {"async_pool_class": "redis.ConnectionPool"},
+            "async_pool_class must be the driver's async ConnectionPool; "
+            "got redis.connection.ConnectionPool.",
+        ),
+        (
+            {"async_pool_class": "valkey.asyncio.ConnectionPool"},
+            "async_pool_class must be the driver's async ConnectionPool; "
+            "got valkey.asyncio.connection.ConnectionPool.",
+        ),
+        (
+            {"serializer": object()},
+            "serializer must provide dumps() and loads(); got object.",
+        ),
+        ({"decode_responses": True}, "Native caches require decode_responses=False."),
     ],
 )
-def test_invalid_configuration_is_rejected(options):
-    with pytest.raises(ImproperlyConfigured):
+def test_invalid_configuration_is_rejected(options, message):
+    if "valkey" in str(options.get("async_pool_class")):
+        pytest.importorskip("valkey")
+    with pytest.raises(ImproperlyConfigured) as error:
         AsyncRedisCache("redis://localhost", {"OPTIONS": options})
+    assert str(error.value) == message
 
 
 async def test_decorated_async_callbacks_do_not_run_sync_prefix_on_loop():
@@ -286,3 +312,120 @@ async def test_a_configured_cluster_retry_is_kept():
         assert cache.async_client.retry is retry
     finally:
         await cache.aclose()
+
+
+async def test_lifespan_ping_fails_startup_and_closes_the_backend():
+    from django.core.cache import caches
+    from django.test import override_settings
+    from redis.exceptions import ConnectionError
+
+    from aiodrf_async_cache.lifespan import cache_lifespan
+
+    config = {
+        "native": {
+            "BACKEND": "aiodrf_async_cache.redis.AsyncRedisCache",
+            # Nothing listens on port 1; the connection is refused at once.
+            "LOCATION": "redis://127.0.0.1:1/0",
+            "OPTIONS": {"socket_connect_timeout": 2},
+        }
+    }
+    created = []
+
+    def create_connection(alias):
+        created.append(create(alias))
+        return created[-1]
+
+    create = caches.create_connection
+    entered = False
+    with (
+        override_settings(CACHES=config),
+        patch.object(caches, "create_connection", create_connection),
+    ):
+        with pytest.raises(ConnectionError):
+            async with cache_lifespan("native", ping=True):
+                entered = True
+    assert not entered
+    (backend,) = created
+    with pytest.raises(RuntimeError, match="closed"):
+        _ = backend.async_client
+
+
+async def test_lifespan_without_ping_opens_nothing():
+    from django.test import override_settings
+
+    from aiodrf_async_cache.lifespan import cache_lifespan
+
+    config = {
+        "native": {
+            "BACKEND": "aiodrf_async_cache.redis.AsyncRedisCache",
+            "LOCATION": "redis://127.0.0.1:1/0",
+        }
+    }
+    with override_settings(CACHES=config):
+        async with cache_lifespan("native") as backend:
+            assert backend._async_client is None
+
+
+async def test_lifespan_ping_requires_the_native_client():
+    pytest.importorskip("django_valkey")
+    from django.test import override_settings
+
+    from aiodrf_async_cache.lifespan import cache_lifespan
+
+    config = {
+        "vendor": {
+            "BACKEND": "django_valkey.async_cache.cache.AsyncValkeyCache",
+            "LOCATION": "valkey://127.0.0.1:1/0",
+            "OPTIONS": {
+                "CONNECTION_FACTORY": "aiodrf_async_cache.django_valkey.LifespanConnectionFactory",
+                "CLOSE_CONNECTION": True,
+            },
+        }
+    }
+    with override_settings(CACHES=config):
+        with pytest.raises(ImproperlyConfigured) as error:
+            async with cache_lifespan("vendor", ping=True):
+                pass
+    assert str(error.value) == (
+        "ping=True requires a backend with async_client; got AsyncValkeyCache."
+    )
+
+
+@pytest.mark.parametrize("shield", [False, True])
+async def test_cancelled_cluster_batches_finish_when_the_driver_needs_it(shield):
+    # valkey-py 6.1 keeps a Cluster node's connection if its pipeline is
+    # cancelled, so that backend lets the pipeline finish on its own.
+    class Cache(AsyncRedisCache):
+        _shield_cluster_pipelines = shield
+
+    cache = Cache("redis://localhost:7000", {"OPTIONS": {"topology": "cluster"}})
+    started, release = asyncio.Event(), asyncio.Event()
+    finished = []
+
+    async def execute():
+        started.set()
+        await release.wait()
+        finished.append(True)
+        return [b"1"]
+
+    pipeline = MagicMock()
+    pipeline.__aenter__.return_value = pipeline
+    pipeline.execute = execute
+    cache._async_client = MagicMock()
+    cache._async_client.pipeline.return_value = pipeline
+    task = asyncio.create_task(cache.aget_many(["a"]))
+    await asyncio.wait_for(started.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()
+    await asyncio.gather(*cache._pipelines)
+    assert finished == ([True] if shield else [])
+    assert pipeline.__aexit__.await_count == 1
+    assert not cache._pipelines
+
+
+def test_only_the_valkey_backend_shields_cluster_pipelines():
+    assert AsyncRedisCache._shield_cluster_pipelines is False
+    valkey = pytest.importorskip("aiodrf_async_cache.valkey")
+    assert valkey.AsyncValkeyCache._shield_cluster_pipelines is True
