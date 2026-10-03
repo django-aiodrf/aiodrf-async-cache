@@ -1,0 +1,30 @@
+# Dedicated Linux/CI test services; no ports are exposed outside loopback.
+# Docker host networking lets Cluster advertise addresses reachable by host tests.
+name: aiodrf-cache-topologies
+x-node: &node
+  image: ${CACHE_IMAGE:-redis:7.4-alpine}
+  network_mode: host
+  mem_limit: 128m
+  tmpfs: [/data]
+services:
+  cluster-one:
+    <<: *node
+    command: ["${CACHE_SERVER:-redis-server}", --bind, 127.0.0.1, --port, "17631", --cluster-enabled, "yes", --cluster-config-file, nodes.conf, --cluster-announce-ip, 127.0.0.1, --save, "", --appendonly, "no"]
+  cluster-two:
+    <<: *node
+    command: ["${CACHE_SERVER:-redis-server}", --bind, 127.0.0.1, --port, "17632", --cluster-enabled, "yes", --cluster-config-file, nodes.conf, --cluster-announce-ip, 127.0.0.1, --save, "", --appendonly, "no"]
+  cluster-three:
+    <<: *node
+    command: ["${CACHE_SERVER:-redis-server}", --bind, 127.0.0.1, --port, "17633", --cluster-enabled, "yes", --cluster-config-file, nodes.conf, --cluster-announce-ip, 127.0.0.1, --save, "", --appendonly, "no"]
+  primary:
+    <<: *node
+    command: ["${CACHE_SERVER:-redis-server}", --bind, 127.0.0.1, --port, "17634", --save, "", --appendonly, "no"]
+  replica:
+    <<: *node
+    command: ["${CACHE_SERVER:-redis-server}", --bind, 127.0.0.1, --port, "17635", --replicaof, 127.0.0.1, "17634", --save, "", --appendonly, "no"]
+  sentinel:
+    <<: *node
+    # Sentinel rewrites its own runtime configuration, so copy the test template.
+    entrypoint: [sh, -c]
+    command: ["cp /config/sentinel.conf /data/sentinel.conf && exec ${CACHE_SERVER:-redis-server} /data/sentinel.conf --sentinel"]
+    volumes: ["./sentinel.conf:/config/sentinel.conf:ro"]

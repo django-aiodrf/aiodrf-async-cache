@@ -1,0 +1,121 @@
+name: Tests
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_COLOR: '1'
+
+jobs:
+  approval:
+    # A pull request that the maintainer did not open and push waits for the
+    # maintainer's approval of the `pull-request-ci` environment before any
+    # job runs its code.
+    if: >-
+      github.event_name == 'pull_request' &&
+      (github.event.pull_request.user.login != 'ctolon' || github.actor != 'ctolon')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: pull-request-ci
+    steps:
+      - run: echo "Approved by a maintainer."
+
+  quality:
+    needs: approval
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: '0.12.13'
+      - run: uv python install 3.14
+      - run: uv run nox -s lint typecheck
+
+  matrix:
+    needs: approval
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.12', '3.13', '3.14']
+        django: ['5.2', '6.0', '6.1']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: '0.12.13'
+      - run: uv python install "$TEST_PYTHON"
+        env:
+          TEST_PYTHON: ${{ matrix.python }}
+      - run: uv run nox -s "tests-$TEST_PYTHON(django='$TEST_DJANGO')"
+        env:
+          TEST_PYTHON: ${{ matrix.python }}
+          TEST_DJANGO: ${{ matrix.django }}
+
+  services:
+    # The Redis and Valkey contract and fault tests, against disposable
+    # service containers. Sentinel and Cluster run locally: see
+    # tests/services/cache-topologies.md.
+    needs: approval
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      redis:
+        image: redis:7.4
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s --health-retries 20
+      valkey:
+        image: valkey/valkey:8.1
+        ports: ['6380:6379']
+        options: >-
+          --health-cmd "valkey-cli ping" --health-interval 2s --health-retries 20
+    env:
+      AIODRF_TEST_REDIS_URL: redis://localhost:6379/0
+      AIODRF_TEST_VALKEY_URL: valkey://localhost:6380/0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: '0.12.13'
+      - run: uv python install 3.14
+      - run: uv run nox -s "tests-3.14(django='6.1')"
+
+  package:
+    needs: approval
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: '0.12.13'
+      - run: uv python install 3.14
+      - run: uv run nox -s distribution
+      - run: uv build
+      - run: uvx twine check --strict dist/*

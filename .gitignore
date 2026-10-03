@@ -1,0 +1,11 @@
+.venv/
+.nox/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+dist/
+*.egg-info/
+.coverage*
+uv.lock

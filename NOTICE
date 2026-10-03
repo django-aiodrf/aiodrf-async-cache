@@ -1,0 +1,2 @@
+Extracted from django-aiodrf. Copyright and BSD-3-Clause license retained.
+Uses Django and asgiref public APIs.
